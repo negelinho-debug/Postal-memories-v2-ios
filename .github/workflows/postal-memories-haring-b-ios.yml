@@ -1,0 +1,995 @@
+name: Postal Memories Haring B iOS - v1 HYBRID
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recover_hybrid:
+    name: Old Mono logic + Haring B beta assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            jq \
+            unzip \
+            zip \
+            xz-utils \
+            file \
+            python3
+
+          rm -rf work tools output hybrid-project.tar.gz
+          mkdir -p work/releases tools output
+
+      - name: Find Haring B beta APK and old Mono Postal Memories APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== SEARCHING GITHUB RELEASES FOR APKs ====="
+
+          TAGS="$(
+            gh release list \
+              --limit 20 \
+              --json tagName \
+              --jq '.[].tagName'
+          )"
+
+          if [ -z "$TAGS" ]; then
+            echo "ERROR: No GitHub Releases found."
+            exit 1
+          fi
+
+          BETA=""
+          OLD=""
+
+          while IFS= read -r TAG; do
+            [ -z "$TAG" ] && continue
+
+            SAFE_TAG="$(echo "$TAG" | tr '/ ' '__')"
+            DIR="work/releases/$SAFE_TAG"
+            mkdir -p "$DIR"
+
+            echo "Checking release: $TAG"
+
+            gh release download "$TAG" \
+              --dir "$DIR" \
+              --pattern "*.apk" \
+              2>/dev/null || true
+
+            while IFS= read -r APK; do
+              [ -z "$APK" ] && continue
+
+              echo "Inspecting: $APK"
+
+              if unzip -l "$APK" \
+                | grep -q 'assets/bin/Data/Managed/Assembly-CSharp.dll'; then
+                if [ -z "$OLD" ]; then
+                  OLD="$APK"
+                  echo "FOUND OLD MONO APK: $OLD"
+                fi
+              fi
+
+              if unzip -l "$APK" \
+                | grep -q 'assets/bin/Data/Managed/Metadata/global-metadata.dat'; then
+
+                NAME="$(basename "$APK" | tr '[:upper:]' '[:lower:]')"
+
+                if [[ "$NAME" == *beta* ]] || [[ "$NAME" == *haring* ]]; then
+                  BETA="$APK"
+                  echo "FOUND HARING B BETA APK: $BETA"
+                elif [ -z "$BETA" ]; then
+                  # fallback: candidate IL2CPP APK; Unity version is verified later
+                  BETA="$APK"
+                  echo "FOUND IL2CPP BETA CANDIDATE: $BETA"
+                fi
+              fi
+            done < <(find "$DIR" -type f -iname '*.apk' -print)
+
+            if [ -n "$BETA" ] && [ -n "$OLD" ]; then
+              break
+            fi
+          done <<< "$TAGS"
+
+          if [ -z "$BETA" ]; then
+            echo "ERROR: Haring B/Beta IL2CPP APK not found in Releases."
+            echo "Upload PostalMemories_Beta.apk to any GitHub Release."
+            exit 1
+          fi
+
+          if [ -z "$OLD" ]; then
+            echo "ERROR: Old Mono Postal Memories APK not found in Releases."
+            echo "Upload the OLD working Postal Memories Android APK to a GitHub Release too."
+            exit 1
+          fi
+
+          cp "$BETA" work/HaringB-Beta.apk
+          cp "$OLD" work/PostalMemories-Old-Mono.apk
+
+          ls -lh work/HaringB-Beta.apk work/PostalMemories-Old-Mono.apk
+
+      - name: Extract both APKs and verify engines
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p work/beta work/old
+          unzip -q work/HaringB-Beta.apk -d work/beta
+          unzip -q work/PostalMemories-Old-Mono.apk -d work/old
+
+          BETA_DATA="$PWD/work/beta/assets/bin/Data"
+          OLD_DATA="$PWD/work/old/assets/bin/Data"
+
+          test -f "$OLD_DATA/Managed/Assembly-CSharp.dll"
+          test -f "$BETA_DATA/Managed/Metadata/global-metadata.dat"
+          test -f "$PWD/work/beta/lib/arm64-v8a/libil2cpp.so"
+
+          BETA_UNITY="$(
+            strings "$BETA_DATA/data.unity3d" \
+              | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+              | sed -n '1p'
+          )"
+
+          OLD_UNITY="$(
+            strings "$OLD_DATA/data.unity3d" \
+              | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+              | sed -n '1p'
+          )"
+
+          echo "BETA_UNITY=$BETA_UNITY"
+          echo "OLD_UNITY=$OLD_UNITY"
+
+          if [ "$BETA_UNITY" != "6000.2.10f1" ]; then
+            echo "ERROR: Expected Haring B beta Unity 6000.2.10f1."
+            echo "Detected: $BETA_UNITY"
+            exit 1
+          fi
+
+          echo "$BETA_DATA" > output/beta-data-dir.txt
+          echo "$OLD_DATA" > output/old-data-dir.txt
+          echo "$BETA_UNITY" > output/beta-unity-version.txt
+          echo "$OLD_UNITY" > output/old-unity-version.txt
+
+          echo "===== DATA SIZES ====="
+          ls -lh \
+            "$BETA_DATA/data.unity3d" \
+            "$OLD_DATA/data.unity3d" \
+            "$OLD_DATA/Managed/Assembly-CSharp.dll"
+
+      - name: Copy original Haring B icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ICON="work/beta/res/oj.png"
+
+          if [ ! -f "$ICON" ]; then
+            ICON="$(
+              python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          def png_size(path):
+              try:
+                  b = path.read_bytes()[:24]
+                  if b[:8] != b'\x89PNG\r\n\x1a\n':
+                      return None
+                  w, h = struct.unpack(">II", b[16:24])
+                  return w, h
+              except Exception:
+                  return None
+
+          best = None
+          for p in Path("work/beta/res").rglob("*.png"):
+              s = png_size(p)
+              if not s:
+                  continue
+              w, h = s
+              if w == h and w >= 96:
+                  score = w * h
+                  if best is None or score > best[0]:
+                      best = (score, p)
+
+          print(best[1] if best else "")
+          PY
+            )"
+          fi
+
+          if [ -z "${ICON:-}" ] || [ ! -f "$ICON" ]; then
+            echo "ERROR: Haring B icon not found."
+            exit 1
+          fi
+
+          cp "$ICON" output/HaringB-AppIcon.png
+          file output/HaringB-AppIcon.png
+          ls -lh output/HaringB-AppIcon.png
+
+      - name: Download AssetRipper 2.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api repos/AssetRipper/AssetRipper/releases/tags/2.0.0 \
+            --jq '.assets[].name' \
+            > output/assetripper-assets.txt
+
+          ASSET="$(
+            grep -Ei '^AssetRipper_linux_(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+              output/assetripper-assets.txt \
+              | sed -n '1p'
+          )"
+
+          if [ -z "$ASSET" ]; then
+            ASSET="$(
+              grep -Ei 'linux.*(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+                output/assetripper-assets.txt \
+                | sed -n '1p'
+            )"
+          fi
+
+          if [ -z "$ASSET" ]; then
+            echo "ERROR: AssetRipper Linux x64 archive not found."
+            exit 1
+          fi
+
+          gh release download 2.0.0 \
+            -R AssetRipper/AssetRipper \
+            -p "$ASSET" \
+            -D tools
+
+          mkdir -p tools/assetripper
+
+          case "tools/$ASSET" in
+            *.tar.xz) tar -xJf "tools/$ASSET" -C tools/assetripper ;;
+            *.zip) unzip -q "tools/$ASSET" -d tools/assetripper ;;
+            *) exit 1 ;;
+          esac
+
+          RIPPER="$(
+            find tools/assetripper -type f \
+              \( -name AssetRipper.GUI.Free -o -name AssetRipper.GUI -o -name AssetRipper \) \
+              | sed -n '1p'
+          )"
+
+          test -n "$RIPPER"
+          chmod +x "$RIPPER"
+          echo "$RIPPER" > output/assetripper-path.txt
+
+      - name: Recover old Mono Unity project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RIPPER="$(cat output/assetripper-path.txt)"
+          DATA="$(cat output/old-data-dir.txt)"
+          DEST="$PWD/work/recovered-old"
+          PORT=3331
+
+          "$RIPPER" --headless --port "$PORT" > output/assetripper-old.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in $(seq 1 90); do
+            curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          curl -fsS \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "Path=$DATA" \
+            "http://127.0.0.1:$PORT/LoadFolder" \
+            -o output/load-old.txt
+
+          mkdir -p "$DEST"
+
+          curl -fsS \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "Path=$DEST" \
+            --data-urlencode 'CreateSubfolder=false' \
+            "http://127.0.0.1:$PORT/Export/UnityProject" \
+            -o output/export-old.txt
+
+          cleanup
+          trap - EXIT
+
+          PROJECT=""
+          if [ -d "$DEST/ExportedProject/Assets" ]; then
+            PROJECT="$DEST/ExportedProject"
+          elif [ -d "$DEST/Assets" ]; then
+            PROJECT="$DEST"
+          fi
+
+          test -n "$PROJECT"
+          echo "$PROJECT" > output/old-project-path.txt
+
+          echo "OLD_CS=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+          echo "OLD_SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+
+      - name: Recover Haring B beta Unity project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RIPPER="$(cat output/assetripper-path.txt)"
+          DATA="$(cat output/beta-data-dir.txt)"
+          DEST="$PWD/work/recovered-beta"
+          PORT=3332
+
+          "$RIPPER" --headless --port "$PORT" > output/assetripper-beta.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in $(seq 1 90); do
+            curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          curl -fsS \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "Path=$DATA" \
+            "http://127.0.0.1:$PORT/LoadFolder" \
+            -o output/load-beta.txt
+
+          mkdir -p "$DEST"
+
+          curl -fsS \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "Path=$DEST" \
+            --data-urlencode 'CreateSubfolder=false' \
+            "http://127.0.0.1:$PORT/Export/UnityProject" \
+            -o output/export-beta.txt
+
+          cleanup
+          trap - EXIT
+
+          PROJECT=""
+          if [ -d "$DEST/ExportedProject/Assets" ]; then
+            PROJECT="$DEST/ExportedProject"
+          elif [ -d "$DEST/Assets" ]; then
+            PROJECT="$DEST"
+          fi
+
+          test -n "$PROJECT"
+          echo "$PROJECT" > output/beta-project-path.txt
+
+          echo "BETA_CS=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+          echo "BETA_SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+          echo "BETA_PREFABS=$(find "$PROJECT/Assets" -type f -name '*.prefab' | wc -l)"
+          echo "BETA_MATERIALS=$(find "$PROJECT/Assets" -type f -name '*.mat' | wc -l)"
+
+      - name: Merge old working C# logic into Haring B beta assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OLD="$(cat output/old-project-path.txt)"
+          BETA="$(cat output/beta-project-path.txt)"
+
+          export OLD BETA
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from collections import defaultdict
+
+          old = Path(os.environ["OLD"]) / "Assets"
+          beta = Path(os.environ["BETA"]) / "Assets"
+
+          old_by_name = defaultdict(list)
+          beta_by_name = defaultdict(list)
+
+          for p in old.rglob("*.cs"):
+              old_by_name[p.name.lower()].append(p)
+
+          for p in beta.rglob("*.cs"):
+              beta_by_name[p.name.lower()].append(p)
+
+          patched = []
+          missing_in_old = []
+          ambiguous = []
+
+          for name, beta_files in beta_by_name.items():
+              old_files = old_by_name.get(name, [])
+
+              if len(beta_files) != 1:
+                  ambiguous.append(("beta", name))
+                  continue
+
+              if len(old_files) == 1:
+                  src = old_files[0]
+                  dst = beta_files[0]
+
+                  # Never replace Editor scripts with runtime code or vice versa.
+                  src_editor = "editor" in {x.lower() for x in src.parts}
+                  dst_editor = "editor" in {x.lower() for x in dst.parts}
+                  if src_editor != dst_editor:
+                      ambiguous.append(("editor-mismatch", name))
+                      continue
+
+                  dst.write_bytes(src.read_bytes())
+                  patched.append((src, dst))
+              elif len(old_files) == 0:
+                  missing_in_old.append(beta_files[0])
+              else:
+                  ambiguous.append(("old", name))
+
+          Path("output/hybrid-patched-scripts.txt").write_text(
+              "\n".join(f"{s} -> {d}" for s, d in patched),
+              encoding="utf-8"
+          )
+
+          Path("output/hybrid-new-beta-scripts.txt").write_text(
+              "\n".join(str(x) for x in missing_in_old),
+              encoding="utf-8"
+          )
+
+          Path("output/hybrid-summary.txt").write_text(
+              f"old_unique_script_names={sum(1 for v in old_by_name.values() if len(v)==1)}\n"
+              f"beta_unique_script_names={sum(1 for v in beta_by_name.values() if len(v)==1)}\n"
+              f"patched_from_old={len(patched)}\n"
+              f"beta_scripts_missing_in_old={len(missing_in_old)}\n"
+              f"ambiguous={len(ambiguous)}\n",
+              encoding="utf-8"
+          )
+
+          print(Path("output/hybrid-summary.txt").read_text())
+
+          # We only continue when there is substantial script overlap.
+          if len(patched) < 25:
+              raise SystemExit(
+                  "Too few matching old Mono scripts. Haring B changed too much for the hybrid method."
+              )
+          PY
+
+          cat output/hybrid-summary.txt
+
+      - name: Prepare Haring B project for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(cat output/beta-project-path.txt)"
+
+          # Android-only native libraries cannot be linked into iOS.
+          find "$PROJECT/Assets" -type f \
+            \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) \
+            -delete || true
+
+          cp output/HaringB-AppIcon.png \
+            "$PROJECT/Assets/HaringBAppIcon.png"
+
+          mkdir -p "$PROJECT/Assets/Editor"
+
+          cat > "$PROJECT/Assets/Editor/HaringBIOSBuild.cs" <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+
+          public static class HaringBIOSBuild
+          {
+              private static void ConfigureIcon()
+              {
+                  const string path = "Assets/HaringBAppIcon.png";
+
+                  AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceUpdate);
+                  Texture2D icon = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+
+                  if (icon == null)
+                  {
+                      Debug.LogWarning("HARING B: icon import failed.");
+                      return;
+                  }
+
+                  int[] sizes = PlayerSettings.GetIconSizesForTargetGroup(
+                      BuildTargetGroup.iOS
+                  );
+
+                  if (sizes != null && sizes.Length > 0)
+                  {
+                      Texture2D[] icons = Enumerable.Repeat(icon, sizes.Length).ToArray();
+                      PlayerSettings.SetIconsForTargetGroup(
+                          BuildTargetGroup.iOS,
+                          icons
+                      );
+                  }
+                  else
+                  {
+                      PlayerSettings.SetIconsForTargetGroup(
+                          BuildTargetGroup.iOS,
+                          new[] { icon }
+                      );
+                  }
+              }
+
+              public static void PerformBuild()
+              {
+                  ConfigureIcon();
+
+                  string[] scenes = EditorBuildSettings.scenes
+                      .Where(s => s.enabled && File.Exists(s.path))
+                      .Select(s => s.path)
+                      .ToArray();
+
+                  if (scenes.Length == 0)
+                  {
+                      scenes = AssetDatabase.FindAssets("t:Scene", new[] { "Assets" })
+                          .Select(AssetDatabase.GUIDToAssetPath)
+                          .Where(p => !string.IsNullOrWhiteSpace(p))
+                          .ToArray();
+                  }
+
+                  if (scenes.Length == 0)
+                      throw new Exception("Haring B: no scenes found.");
+
+                  PlayerSettings.productName = "Postal Memories Haring B";
+                  PlayerSettings.companyName = "PostalMemoriesIOS";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.postalmemories.haringb.ios"
+                  );
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.stripEngineCode = false;
+
+                  string location = Path.GetFullPath(
+                      Path.Combine(
+                          Application.dataPath,
+                          "../../build/iOS/HaringB-iOS"
+                      )
+                  );
+
+                  if (Directory.Exists(location))
+                      Directory.Delete(location, true);
+
+                  Directory.CreateDirectory(location);
+
+                  BuildReport report = BuildPipeline.BuildPlayer(
+                      new BuildPlayerOptions
+                      {
+                          scenes = scenes,
+                          locationPathName = location,
+                          target = BuildTarget.iOS,
+                          targetGroup = BuildTargetGroup.iOS,
+                          options = BuildOptions.CleanBuildCache
+                      }
+                  );
+
+                  Debug.Log(
+                      "HARING B iOS BUILD: " +
+                      report.summary.result +
+                      " errors=" + report.summary.totalErrors +
+                      " warnings=" + report.summary.totalWarnings
+                  );
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new Exception(
+                          "Haring B Unity iOS export failed: " +
+                          report.summary.result
+                      );
+              }
+          }
+          CS
+
+          # Force beta project to its real Unity version.
+          mkdir -p "$PROJECT/ProjectSettings"
+          cat > "$PROJECT/ProjectSettings/ProjectVersion.txt" <<'TXT'
+          m_EditorVersion: 6000.2.10f1
+          m_EditorVersionWithRevision: 6000.2.10f1
+          TXT
+
+      - name: Pack hybrid project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(cat output/beta-project-path.txt)"
+
+          tar \
+            --exclude='Library' \
+            --exclude='Temp' \
+            --exclude='obj' \
+            -czf hybrid-project.tar.gz \
+            -C "$(dirname "$PROJECT")" \
+            "$(basename "$PROJECT")"
+
+          ls -lh hybrid-project.tar.gz
+
+      - name: Upload hybrid Unity project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-Memories-Haring-B-v1-Hybrid-Project
+          path: hybrid-project.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-Memories-Haring-B-v1-Recovery-Diagnostics
+          path: |
+            output
+          if-no-files-found: warn
+          compression-level: 6
+
+  build_ios:
+    name: Build Haring B first iOS IPA
+    needs: recover_hybrid
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    env:
+      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download hybrid project
+        uses: actions/download-artifact@v4
+        with:
+          name: Postal-Memories-Haring-B-v1-Hybrid-Project
+          path: hybrid-download
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p project output build
+
+          ARCHIVE="$(find hybrid-download -type f -name '*.tar.gz' | sed -n '1p')"
+          test -f "$ARCHIVE"
+
+          tar -xzf "$ARCHIVE" -C project
+
+          PROJECT="$(
+            find project -type f \
+              -path '*/ProjectSettings/ProjectVersion.txt' \
+              -print \
+              | sed -n '1p' \
+              | xargs -I{} dirname {} \
+              | xargs -I{} dirname {}
+          )"
+
+          test -d "$PROJECT/Assets"
+          echo "$PROJECT" > output/project-path.txt
+
+          cat "$PROJECT/ProjectSettings/ProjectVersion.txt"
+
+          if [ -f "$PROJECT/Assets/HaringBAppIcon.png" ]; then
+            sips -z 1024 1024 \
+              "$PROJECT/Assets/HaringBAppIcon.png" \
+              --out "$PROJECT/Assets/HaringBAppIcon.png" \
+              >/dev/null
+          fi
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Unity Hub
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @rage-against-the-pixel/unity-cli
+          unity-cli hub-install --json
+          unity-cli hub-version || true
+
+      - name: Activate Unity Personal
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UNITY_EMAIL:-}" ] || [ -z "${UNITY_PASSWORD:-}" ]; then
+            echo "ERROR: UNITY_USERNAME / UNITY_PASSWORD secrets are missing."
+            exit 1
+          fi
+
+          unity-cli activate-license \
+            --license personal \
+            --email "$UNITY_EMAIL" \
+            --password "$UNITY_PASSWORD" \
+            --json
+
+      - name: Install official Unity CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export UNITY_CLI_HOME="$PWD/tools/unity-cli"
+          export UNITY_CLI_CHANNEL="beta"
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+
+          mkdir -p "$UNITY_CLI_HOME"
+
+          curl -fsSL --retry 5 --retry-delay 3 \
+            https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh \
+            -o /tmp/unity-cli-install.sh
+
+          bash /tmp/unity-cli-install.sh
+
+          echo "$UNITY_CLI_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Unity 6000.2.10f1 + iOS module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNITY="$PWD/tools/unity-cli/bin/unity"
+          ROOT="$HOME/UnityEditors"
+          VERSION="6000.2.10f1"
+
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+
+          mkdir -p "$ROOT"
+
+          "$UNITY" --non-interactive --no-banner --no-color \
+            editors install-path --set "$ROOT"
+
+          "$UNITY" --non-interactive --no-banner --no-color \
+            install "$VERSION" \
+            --module ios \
+            --no-child-modules \
+            --yes \
+            --accept-eula \
+            2>&1 | tee output/unity-install.log
+
+          UNITY_BIN="$(
+            find "$ROOT" \
+              -type f \
+              -path '*/Unity.app/Contents/MacOS/Unity' \
+              -print \
+              | sed -n '1p'
+          )"
+
+          if [ -z "$UNITY_BIN" ] || [ ! -x "$UNITY_BIN" ]; then
+            echo "ERROR: Unity 6000.2.10f1 executable not found."
+            exit 1
+          fi
+
+          echo "$UNITY_BIN" > output/unity-bin.txt
+
+      - name: Unity compile + export Xcode
+        id: unity_build
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+
+          UNITY_BIN="$(cat output/unity-bin.txt)"
+          PROJECT="$(cat output/project-path.txt)"
+
+          "$UNITY_BIN" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PROJECT" \
+            -buildTarget iOS \
+            -executeMethod HaringBIOSBuild.PerformBuild \
+            -logFile - \
+            2>&1 | tee output/unity-build.log
+
+          RC=${PIPESTATUS[0]}
+          echo "$RC" > output/unity-exit-code.txt
+          exit "$RC"
+
+      - name: Extract Unity errors
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          grep -E \
+            'error CS[0-9]+|Scripts have compiler errors|BuildFailedException|Exception:|error:' \
+            output/unity-build.log \
+            | tail -500 \
+            > output/error-summary.txt || true
+
+          cat output/error-summary.txt || true
+
+      - name: Locate Xcode project
+        id: locate_xcode
+        if: steps.unity_build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJ="$(
+            find "$PWD" \
+              -type d \
+              -name 'Unity-iPhone.xcodeproj' \
+              -print \
+              | sed -n '1p'
+          )"
+
+          if [ -z "$PROJ" ]; then
+            PROJ="$(
+              find "$PWD" \
+                -type d \
+                -name '*.xcodeproj' \
+                -print \
+                | grep -v '/DerivedData/' \
+                | sed -n '1p'
+            )"
+          fi
+
+          test -d "$PROJ"
+
+          XCODE_DIR="$(dirname "$PROJ")"
+          WORKSPACE="$(
+            find "$XCODE_DIR" \
+              -maxdepth 2 \
+              -type d \
+              -name '*.xcworkspace' \
+              | sed -n '1p'
+          )"
+
+          echo "$PROJ" > output/xcode-project.txt
+          echo "$WORKSPACE" > output/xcode-workspace.txt
+
+          if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
+            xcodebuild -workspace "$WORKSPACE" -list
+          else
+            xcodebuild -project "$PROJ" -list
+          fi
+
+      - name: Build unsigned iOS app
+        id: xcode_build
+        if: steps.unity_build.outcome == 'success' && steps.locate_xcode.outcome == 'success'
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+
+          PROJ="$(cat output/xcode-project.txt)"
+          WORKSPACE="$(cat output/xcode-workspace.txt)"
+
+          rm -rf DerivedData
+          mkdir -p DerivedData
+
+          ARGS=(
+            -scheme Unity-iPhone
+            -configuration Release
+            -sdk iphoneos
+            -destination 'generic/platform=iOS'
+            -derivedDataPath "$PWD/DerivedData"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=
+            DEVELOPMENT_TEAM=
+            ARCHS=arm64
+            ONLY_ACTIVE_ARCH=YES
+          )
+
+          if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              "${ARGS[@]}" \
+              build \
+              2>&1 | tee output/xcodebuild.log
+          else
+            xcodebuild \
+              -project "$PROJ" \
+              "${ARGS[@]}" \
+              build \
+              2>&1 | tee output/xcodebuild.log
+          fi
+
+          RC=${PIPESTATUS[0]}
+          echo "$RC" > output/xcode-exit-code.txt
+          exit "$RC"
+
+      - name: Package unsigned Haring B IPA
+        if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(
+            find "$PWD/DerivedData/Build/Products" \
+              -type d \
+              -name '*.app' \
+              -path '*Release-iphoneos*' \
+              | sed -n '1p'
+          )"
+
+          test -d "$APP"
+
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+
+          /usr/bin/zip -qry \
+            Postal-Memories-Haring-B-iOS-v1-UNSIGNED.ipa \
+            Payload
+
+          ls -lh Postal-Memories-Haring-B-iOS-v1-UNSIGNED.ipa
+
+      - name: Upload unsigned IPA
+        if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-Memories-Haring-B-iOS-v1-UNSIGNED
+          path: Postal-Memories-Haring-B-iOS-v1-UNSIGNED.ipa
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-Memories-Haring-B-iOS-v1-Build-Diagnostics
+          path: |
+            output
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: Final status
+        if: always()
+        shell: bash
+        run: |
+          echo "Unity outcome: ${{ steps.unity_build.outcome }}"
+          echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
+
+          if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
+            echo "HARING B v1: hybrid scripts did not compile yet."
+            exit 1
+          fi
+
+          if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
+            echo "HARING B v1: Unity export succeeded but Xcode build failed."
+            exit 1
+          fi
+
+          echo "HARING B v1: FIRST UNSIGNED IPA CREATED."
+
+      - name: Return Unity license
+        if: always()
+        shell: bash
+        run: |
+          if command -v unity-cli >/dev/null 2>&1; then
+            unity-cli return-license --license personal || true
+          fi
