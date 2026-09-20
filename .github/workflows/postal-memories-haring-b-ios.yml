@@ -1,4 +1,4 @@
-name: Postal Memories Haring B iOS - v4 EVENTSYSTEMS REAL FIX
+name: Postal Memories Haring B iOS - v5 OFFICIAL UGUI SOURCE FIX
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   recover_hybrid:
-    name: Haring B v4 - real Unity EventSystems fix
+    name: Haring B v5 - official UGUI/TMP source fix
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -508,7 +508,7 @@ jobs:
 
           cat output/hybrid-summary.txt
 
-      - name: Fix EventSystems correctly - use real Unity UI package
+      - name: Replace AssetRipper fake UI/TMP with official Unity UGUI 2.0.0 source
         shell: bash
         run: |
           set -euo pipefail
@@ -516,100 +516,246 @@ jobs:
           PROJECT="$(cat output/beta-project-path.txt)"
           export PROJECT
 
-          python3 - <<'PYFIX'
+          mkdir -p work/ugui-package
+
+          echo "===== GET OFFICIAL UGUI 2.0.0 TARBALL ====="
+
+          META="$(
+            curl -fsSL --retry 5 --retry-delay 3 \
+              https://packages.unity.com/com.unity.ugui
+          )"
+
+          TARBALL="$(
+            printf '%s' "$META" \
+              | jq -r '.versions["2.0.0"].dist.tarball // empty'
+          )"
+
+          if [ -z "$TARBALL" ]; then
+            echo "ERROR: Could not resolve com.unity.ugui 2.0.0 tarball."
+            exit 1
+          fi
+
+          echo "UGUI_TARBALL=$TARBALL"
+
+          curl -fL --retry 5 --retry-delay 3 \
+            "$TARBALL" \
+            -o work/com.unity.ugui-2.0.0.tgz
+
+          tar -xzf work/com.unity.ugui-2.0.0.tgz \
+            -C work/ugui-package
+
+          PKG="$PWD/work/ugui-package/package"
+
+          test -d "$PKG/Runtime/UGUI"
+          test -d "$PKG/Runtime/TMP"
+          test -f "$PKG/Runtime/UGUI/UnityEngine.UI.asmdef"
+          test -f "$PKG/Runtime/TMP/Unity.TextMeshPro.asmdef"
+
+          export PKG
+
+          python3 - <<'PY'
           import json
           import os
           import re
+          import shutil
+          from collections import defaultdict
           from pathlib import Path
 
           project = Path(os.environ["PROJECT"])
+          pkg = Path(os.environ["PKG"])
           assets = project / "Assets"
-          packages = project / "Packages"
-          packages.mkdir(parents=True, exist_ok=True)
 
-          changed = []
-          removed = []
+          ui_dir = assets / "Scripts" / "UnityEngine.UI"
+          tmp_dir = assets / "Scripts" / "Unity.TextMeshPro"
 
-          # Remove only AssetRipper copies of Unity's own EventSystems source.
-          # Do not rewrite them: Unity's real uGUI package should provide them.
-          for p in list(assets.rglob("*.cs")):
-              posix = p.as_posix().lower()
-              is_recovered_eventsystems = (
-                  "/unityengine.ui/" in posix and "/eventsystems/" in posix
+          official_ui = pkg / "Runtime" / "UGUI"
+          official_tmp = pkg / "Runtime" / "TMP"
+
+          if not ui_dir.exists():
+              raise SystemExit(f"Recovered UnityEngine.UI folder missing: {ui_dir}")
+
+          if not tmp_dir.exists():
+              raise SystemExit(f"Recovered Unity.TextMeshPro folder missing: {tmp_dir}")
+
+          report = []
+          stats = {
+              "ui_existing": 0,
+              "ui_replaced": 0,
+              "ui_deleted_fake": 0,
+              "ui_added": 0,
+              "tmp_existing": 0,
+              "tmp_replaced": 0,
+              "tmp_deleted_fake": 0,
+              "tmp_added": 0,
+              "gameplay_patched": 0,
+          }
+
+          def official_map(root: Path):
+              by_name = defaultdict(list)
+              for p in root.rglob("*.cs"):
+                  by_name[p.name].append(p)
+              return by_name
+
+          def replace_runtime(recovered: Path, official: Path, prefix: str):
+              by_name = official_map(official)
+
+              old_files = list(recovered.rglob("*.cs"))
+              stats[prefix + "_existing"] = len(old_files)
+
+              used_official = set()
+
+              # Preserve old .meta GUIDs whenever the official package has a
+              # unique source file with the same filename.
+              for old in old_files:
+                  matches = by_name.get(old.name, [])
+
+                  if len(matches) == 1:
+                      src = matches[0]
+                      old.write_bytes(src.read_bytes())
+                      used_official.add(src.resolve())
+                      stats[prefix + "_replaced"] += 1
+                      report.append(f"REPLACED {old} <= {src}")
+                  else:
+                      # AssetRipper creates one-file-per-type stubs for many
+                      # interfaces/enums. Official UGUI often groups those
+                      # types together (e.g. EventInterfaces.cs). Keeping the
+                      # fake stub would shadow the real type, so remove it.
+                      meta = Path(str(old) + ".meta")
+                      old.unlink(missing_ok=True)
+                      if meta.exists():
+                          meta.unlink()
+                      stats[prefix + "_deleted_fake"] += 1
+                      report.append(f"REMOVED_FAKE {old}")
+
+              # Replace the recovered asmdef with the official one, but keep
+              # the old asmdef .meta if it exists so serialized references stay stable.
+              asmdef_name = (
+                  "UnityEngine.UI.asmdef"
+                  if prefix == "ui"
+                  else "Unity.TextMeshPro.asmdef"
               )
-              is_engine_stub = (
-                  "/scripts/unityengine" in posix
-                  and p.name in {
-                      "IEventSystemHandler.cs",
-                      "PointerEventData.cs",
-                      "BaseEventData.cs",
-                      "AxisEventData.cs",
-                      "EventSystem.cs",
-                  }
-              )
-              if not (is_recovered_eventsystems or is_engine_stub):
-                  continue
-              removed.append(str(p))
-              meta = Path(str(p) + ".meta")
-              p.unlink(missing_ok=True)
-              meta.unlink(missing_ok=True)
 
-          # Ensure Unity 6's real uGUI/EventSystems package exists.
-          manifest = packages / "manifest.json"
-          data = {}
+              official_asmdef = official / asmdef_name
+              recovered_asmdef = recovered / asmdef_name
+
+              if official_asmdef.exists():
+                  recovered_asmdef.parent.mkdir(parents=True, exist_ok=True)
+                  recovered_asmdef.write_bytes(official_asmdef.read_bytes())
+                  report.append(
+                      f"OFFICIAL_ASMDEF {recovered_asmdef} <= {official_asmdef}"
+                  )
+
+              # Add every official source that did not map onto an existing
+              # recovered filename. Put them in a dedicated subfolder.
+              extra_root = recovered / "_OfficialPackageExtra"
+              for src in official.rglob("*.cs"):
+                  if src.resolve() in used_official:
+                      continue
+
+                  rel = src.relative_to(official)
+                  dst = extra_root / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
+                  stats[prefix + "_added"] += 1
+                  report.append(f"ADDED {dst} <= {src}")
+
+          replace_runtime(ui_dir, official_ui, "ui")
+          replace_runtime(tmp_dir, official_tmp, "tmp")
+
+          # Remove package dependency added by v4. We now compile the official
+          # UGUI/TMP source locally inside Assets, preserving recovered GUIDs.
+          manifest = project / "Packages" / "manifest.json"
           if manifest.exists():
               try:
-                  data = json.loads(manifest.read_text(encoding="utf-8", errors="ignore"))
+                  data = json.loads(
+                      manifest.read_text(encoding="utf-8", errors="ignore")
+                  )
               except Exception:
                   data = {}
-          deps = data.setdefault("dependencies", {})
-          deps.setdefault("com.unity.ugui", "2.0.0")
-          manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-          interface_names = [
-              "IPointerDownHandler", "IPointerUpHandler",
-              "IPointerEnterHandler", "IPointerExitHandler",
-              "IPointerClickHandler", "IDragHandler",
-              "IBeginDragHandler", "IEndDragHandler",
-              "IInitializePotentialDragHandler", "IScrollHandler",
-              "IMoveHandler", "ISubmitHandler", "ICancelHandler",
-              "ISelectHandler", "IDeselectHandler",
-              "IUpdateSelectedHandler", "IDropHandler",
+              deps = data.get("dependencies", {})
+              if isinstance(deps, dict):
+                  deps.pop("com.unity.ugui", None)
+
+              manifest.write_text(
+                  json.dumps(data, indent=2) + "\n",
+                  encoding="utf-8"
+              )
+
+          # Patch only game code that consumes EventSystems.
+          interfaces = [
+              "IPointerDownHandler",
+              "IPointerUpHandler",
+              "IPointerEnterHandler",
+              "IPointerExitHandler",
+              "IPointerClickHandler",
+              "IDragHandler",
+              "IBeginDragHandler",
+              "IEndDragHandler",
+              "IInitializePotentialDragHandler",
+              "IScrollHandler",
+              "IMoveHandler",
+              "ISubmitHandler",
+              "ICancelHandler",
+              "ISelectHandler",
+              "IDeselectHandler",
+              "IUpdateSelectedHandler",
+              "IDropHandler",
           ]
-          event_data_names = ["PointerEventData", "BaseEventData", "AxisEventData"]
 
-          # Patch only recovered game scripts, never UnityEngine.UI/TMP/package code.
+          data_types = [
+              "PointerEventData",
+              "BaseEventData",
+              "AxisEventData",
+          ]
+
           for p in assets.rglob("*.cs"):
               posix = p.as_posix().lower()
-              if "/assembly-csharp/" not in posix and "/assembly-csharp-firstpass/" not in posix:
+
+              if (
+                  "/assembly-csharp/" not in posix
+                  and "/assembly-csharp-firstpass/" not in posix
+              ):
                   continue
-              if "/editor/" in posix or "/tmpro/" in posix:
+
+              if "/editor/" in posix:
                   continue
 
               s = p.read_text(encoding="utf-8", errors="ignore")
+
               if not (
                   "IEventSystemHandler" in s
-                  or any(x in s for x in interface_names)
-                  or any(x in s for x in event_data_names)
+                  or any(x in s for x in interfaces)
+                  or any(x in s for x in data_types)
               ):
                   continue
 
               original = s
 
-              # Pointer/drag interfaces already inherit this. In recovered code it
-              # can resolve to a fake class and cause CS1721 multiple-base-class.
-              s = re.sub(r',\s*(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\b', '', s)
-              s = re.sub(r'(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\s*,\s*', '', s)
+              # Redundant because every handler interface already inherits it.
+              s = re.sub(
+                  r',\s*(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\b',
+                  '',
+                  s
+              )
+              s = re.sub(
+                  r'(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\s*,\s*',
+                  '',
+                  s
+              )
 
-              for short in interface_names:
+              for short in interfaces + data_types:
                   full = "UnityEngine.EventSystems." + short
-                  s = re.sub(rf'(?<![\w.]){re.escape(short)}\b', full, s)
+                  s = re.sub(
+                      rf'(?<![\w.]){re.escape(short)}\b',
+                      full,
+                      s
+                  )
 
-              for short in event_data_names:
-                  full = "UnityEngine.EventSystems." + short
-                  s = re.sub(rf'(?<![\w.]){re.escape(short)}\b', full, s)
-
-              while "UnityEngine.EventSystems.UnityEngine.EventSystems." in s:
+              while (
+                  "UnityEngine.EventSystems.UnityEngine.EventSystems."
+                  in s
+              ):
                   s = s.replace(
                       "UnityEngine.EventSystems.UnityEngine.EventSystems.",
                       "UnityEngine.EventSystems."
@@ -617,29 +763,45 @@ jobs:
 
               if s != original:
                   p.write_text(s, encoding="utf-8")
-                  changed.append(str(p))
+                  stats["gameplay_patched"] += 1
+                  report.append(f"PATCHED_GAMEPLAY {p}")
 
-          Path("output/v4-eventsystems-patched.txt").write_text(
-              "\n".join(changed), encoding="utf-8"
+          Path("output/v5-official-ugui-report.txt").write_text(
+              "\n".join(report),
+              encoding="utf-8"
           )
-          Path("output/v4-recovered-eventsystems-removed.txt").write_text(
-              "\n".join(removed), encoding="utf-8"
+
+          Path("output/v5-official-ugui-summary.txt").write_text(
+              "\n".join(f"{k}={v}" for k, v in stats.items()) + "\n",
+              encoding="utf-8"
           )
 
-          print("REAL_EVENTSYSTEMS_PACKAGE=com.unity.ugui")
-          print("GAMEPLAY_FILES_PATCHED=", len(changed))
-          print("RECOVERED_EVENTSYSTEMS_FILES_REMOVED=", len(removed))
-          for x in changed:
-              print("PATCHED", x)
-          for x in removed:
-              print("REMOVED_FAKE_ENGINE_SOURCE", x)
+          print(Path("output/v5-official-ugui-summary.txt").read_text())
 
-          expected = {"VirtualButtonHold.cs", "UITouchPanel.cs"}
-          patched_names = {Path(x).name for x in changed}
-          missing = expected - patched_names
-          if missing:
-              print("WARNING: expected scripts not patched:", ", ".join(sorted(missing)))
-          PYFIX
+          # Hard checks for the exact collision found in v4.
+          ui_asmdefs = list(project.rglob("UnityEngine.UI.asmdef"))
+          tmp_asmdefs = list(project.rglob("Unity.TextMeshPro.asmdef"))
+
+          print("UnityEngine.UI asmdefs:")
+          for p in ui_asmdefs:
+              print(" ", p)
+
+          print("Unity.TextMeshPro asmdefs:")
+          for p in tmp_asmdefs:
+              print(" ", p)
+
+          # There must be no package copy because it would duplicate the local assembly.
+          packages_manifest = project / "Packages" / "manifest.json"
+          if packages_manifest.exists():
+              txt = packages_manifest.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
+              )
+              if '"com.unity.ugui"' in txt:
+                  raise SystemExit(
+                      "v5 ERROR: com.unity.ugui still present in manifest."
+                  )
+          PY
 
       - name: Prepare Haring B project for iOS
         shell: bash
@@ -804,7 +966,7 @@ jobs:
       - name: Upload hybrid Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v4-Hybrid-Project
+          name: Postal-Memories-Haring-B-v5-Hybrid-Project
           path: hybrid-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -813,7 +975,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v4-Recovery-Diagnostics
+          name: Postal-Memories-Haring-B-v5-Recovery-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -836,7 +998,7 @@ jobs:
       - name: Download hybrid project
         uses: actions/download-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v4-Hybrid-Project
+          name: Postal-Memories-Haring-B-v5-Hybrid-Project
           path: hybrid-download
 
       - name: Extract project
@@ -994,9 +1156,9 @@ jobs:
           set +e
 
           grep -E \
-            'error CS[0-9]+|Scripts have compiler errors|BuildFailedException|Exception:|error:' \
+            'error CS[0-9]+|Scripts have compiler errors|BuildFailedException|Exception:|error:|Assembly with name .* already exists|will not be compiled because|asmdef' \
             output/unity-build.log \
-            | tail -500 \
+            | tail -800 \
             > output/error-summary.txt || true
 
           cat output/error-summary.txt || true
@@ -1114,17 +1276,17 @@ jobs:
           cp -R "$APP" Payload/
 
           /usr/bin/zip -qry \
-            Postal-Memories-Haring-B-iOS-v4-UNSIGNED.ipa \
+            Postal-Memories-Haring-B-iOS-v5-UNSIGNED.ipa \
             Payload
 
-          ls -lh Postal-Memories-Haring-B-iOS-v4-UNSIGNED.ipa
+          ls -lh Postal-Memories-Haring-B-iOS-v5-UNSIGNED.ipa
 
       - name: Upload unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-iOS-v4-UNSIGNED
-          path: Postal-Memories-Haring-B-iOS-v4-UNSIGNED.ipa
+          name: Postal-Memories-Haring-B-iOS-v5-UNSIGNED
+          path: Postal-Memories-Haring-B-iOS-v5-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1132,7 +1294,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-iOS-v4-Build-Diagnostics
+          name: Postal-Memories-Haring-B-iOS-v5-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
