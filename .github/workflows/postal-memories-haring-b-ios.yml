@@ -1,4 +1,4 @@
-name: Postal Memories Haring B iOS - v3 OLD MONO + HARING B
+name: Postal Memories Haring B iOS - v4 EVENTSYSTEMS REAL FIX
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   recover_hybrid:
-    name: Haring B v3 - old Mono logic + beta assets
+    name: Haring B v4 - real Unity EventSystems fix
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -508,6 +508,139 @@ jobs:
 
           cat output/hybrid-summary.txt
 
+      - name: Fix EventSystems correctly - use real Unity UI package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(cat output/beta-project-path.txt)"
+          export PROJECT
+
+          python3 - <<'PYFIX'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          assets = project / "Assets"
+          packages = project / "Packages"
+          packages.mkdir(parents=True, exist_ok=True)
+
+          changed = []
+          removed = []
+
+          # Remove only AssetRipper copies of Unity's own EventSystems source.
+          # Do not rewrite them: Unity's real uGUI package should provide them.
+          for p in list(assets.rglob("*.cs")):
+              posix = p.as_posix().lower()
+              is_recovered_eventsystems = (
+                  "/unityengine.ui/" in posix and "/eventsystems/" in posix
+              )
+              is_engine_stub = (
+                  "/scripts/unityengine" in posix
+                  and p.name in {
+                      "IEventSystemHandler.cs",
+                      "PointerEventData.cs",
+                      "BaseEventData.cs",
+                      "AxisEventData.cs",
+                      "EventSystem.cs",
+                  }
+              )
+              if not (is_recovered_eventsystems or is_engine_stub):
+                  continue
+              removed.append(str(p))
+              meta = Path(str(p) + ".meta")
+              p.unlink(missing_ok=True)
+              meta.unlink(missing_ok=True)
+
+          # Ensure Unity 6's real uGUI/EventSystems package exists.
+          manifest = packages / "manifest.json"
+          data = {}
+          if manifest.exists():
+              try:
+                  data = json.loads(manifest.read_text(encoding="utf-8", errors="ignore"))
+              except Exception:
+                  data = {}
+          deps = data.setdefault("dependencies", {})
+          deps.setdefault("com.unity.ugui", "2.0.0")
+          manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+          interface_names = [
+              "IPointerDownHandler", "IPointerUpHandler",
+              "IPointerEnterHandler", "IPointerExitHandler",
+              "IPointerClickHandler", "IDragHandler",
+              "IBeginDragHandler", "IEndDragHandler",
+              "IInitializePotentialDragHandler", "IScrollHandler",
+              "IMoveHandler", "ISubmitHandler", "ICancelHandler",
+              "ISelectHandler", "IDeselectHandler",
+              "IUpdateSelectedHandler", "IDropHandler",
+          ]
+          event_data_names = ["PointerEventData", "BaseEventData", "AxisEventData"]
+
+          # Patch only recovered game scripts, never UnityEngine.UI/TMP/package code.
+          for p in assets.rglob("*.cs"):
+              posix = p.as_posix().lower()
+              if "/assembly-csharp/" not in posix and "/assembly-csharp-firstpass/" not in posix:
+                  continue
+              if "/editor/" in posix or "/tmpro/" in posix:
+                  continue
+
+              s = p.read_text(encoding="utf-8", errors="ignore")
+              if not (
+                  "IEventSystemHandler" in s
+                  or any(x in s for x in interface_names)
+                  or any(x in s for x in event_data_names)
+              ):
+                  continue
+
+              original = s
+
+              # Pointer/drag interfaces already inherit this. In recovered code it
+              # can resolve to a fake class and cause CS1721 multiple-base-class.
+              s = re.sub(r',\s*(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\b', '', s)
+              s = re.sub(r'(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\s*,\s*', '', s)
+
+              for short in interface_names:
+                  full = "UnityEngine.EventSystems." + short
+                  s = re.sub(rf'(?<![\w.]){re.escape(short)}\b', full, s)
+
+              for short in event_data_names:
+                  full = "UnityEngine.EventSystems." + short
+                  s = re.sub(rf'(?<![\w.]){re.escape(short)}\b', full, s)
+
+              while "UnityEngine.EventSystems.UnityEngine.EventSystems." in s:
+                  s = s.replace(
+                      "UnityEngine.EventSystems.UnityEngine.EventSystems.",
+                      "UnityEngine.EventSystems."
+                  )
+
+              if s != original:
+                  p.write_text(s, encoding="utf-8")
+                  changed.append(str(p))
+
+          Path("output/v4-eventsystems-patched.txt").write_text(
+              "\n".join(changed), encoding="utf-8"
+          )
+          Path("output/v4-recovered-eventsystems-removed.txt").write_text(
+              "\n".join(removed), encoding="utf-8"
+          )
+
+          print("REAL_EVENTSYSTEMS_PACKAGE=com.unity.ugui")
+          print("GAMEPLAY_FILES_PATCHED=", len(changed))
+          print("RECOVERED_EVENTSYSTEMS_FILES_REMOVED=", len(removed))
+          for x in changed:
+              print("PATCHED", x)
+          for x in removed:
+              print("REMOVED_FAKE_ENGINE_SOURCE", x)
+
+          expected = {"VirtualButtonHold.cs", "UITouchPanel.cs"}
+          patched_names = {Path(x).name for x in changed}
+          missing = expected - patched_names
+          if missing:
+              print("WARNING: expected scripts not patched:", ", ".join(sorted(missing)))
+          PYFIX
+
       - name: Prepare Haring B project for iOS
         shell: bash
         run: |
@@ -671,7 +804,7 @@ jobs:
       - name: Upload hybrid Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v3-Hybrid-Project
+          name: Postal-Memories-Haring-B-v4-Hybrid-Project
           path: hybrid-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -680,7 +813,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v3-Recovery-Diagnostics
+          name: Postal-Memories-Haring-B-v4-Recovery-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -703,7 +836,7 @@ jobs:
       - name: Download hybrid project
         uses: actions/download-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v3-Hybrid-Project
+          name: Postal-Memories-Haring-B-v4-Hybrid-Project
           path: hybrid-download
 
       - name: Extract project
@@ -981,17 +1114,17 @@ jobs:
           cp -R "$APP" Payload/
 
           /usr/bin/zip -qry \
-            Postal-Memories-Haring-B-iOS-v3-UNSIGNED.ipa \
+            Postal-Memories-Haring-B-iOS-v4-UNSIGNED.ipa \
             Payload
 
-          ls -lh Postal-Memories-Haring-B-iOS-v3-UNSIGNED.ipa
+          ls -lh Postal-Memories-Haring-B-iOS-v4-UNSIGNED.ipa
 
       - name: Upload unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-iOS-v3-UNSIGNED
-          path: Postal-Memories-Haring-B-iOS-v3-UNSIGNED.ipa
+          name: Postal-Memories-Haring-B-iOS-v4-UNSIGNED
+          path: Postal-Memories-Haring-B-iOS-v4-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -999,7 +1132,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-iOS-v3-Build-Diagnostics
+          name: Postal-Memories-Haring-B-iOS-v4-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
