@@ -1,4 +1,4 @@
-name: Postal Memories Haring B iOS - v6 BUILTIN UGUI FIX
+name: Postal Memories Haring B iOS - v7 MISSING HELPERS + PHYSICS FIX
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   recover_hybrid:
-    name: Haring B v6 - builtin UGUI/TMP + EventSystems fix
+    name: Haring B v7 - missing helpers + PhysicsMaterial fix
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -508,6 +508,197 @@ jobs:
 
           cat output/hybrid-summary.txt
 
+      - name: Restore missing old Mono helper types + Unity 6 PhysicsMaterial compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OLD="$(cat output/old-project-path.txt)"
+          BETA="$(cat output/beta-project-path.txt)"
+
+          export OLD BETA
+
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          old = Path(os.environ["OLD"]) / "Assets"
+          beta = Path(os.environ["BETA"]) / "Assets"
+
+          compat = beta / "Scripts" / "Compatibility" / "OldMonoHelpers"
+          compat.mkdir(parents=True, exist_ok=True)
+
+          report = []
+
+          # ------------------------------------------------------------
+          # 1) Unity 6 rename:
+          #    PhysicMaterial -> PhysicsMaterial
+          # ------------------------------------------------------------
+          physics_changed = 0
+
+          for p in beta.rglob("*.cs"):
+              posix = p.as_posix().lower()
+
+              # Game code only. Don't rewrite imported packages/editor source.
+              if (
+                  "/assembly-csharp/" not in posix
+                  and "/assembly-csharp-firstpass/" not in posix
+              ):
+                  continue
+
+              if "/editor/" in posix:
+                  continue
+
+              s = p.read_text(encoding="utf-8", errors="ignore")
+              new = re.sub(
+                  r'(?<![\w.])PhysicMaterial\b',
+                  'PhysicsMaterial',
+                  s
+              )
+
+              if new != s:
+                  p.write_text(new, encoding="utf-8")
+                  physics_changed += 1
+                  report.append(f"PHYSICS_RENAME {p}")
+
+          # ------------------------------------------------------------
+          # 2) The Haring B scripts reference helper types that exist in
+          #    the old Mono Assembly-CSharp but AssetRipper did not export
+          #    into the beta project as usable source.
+          #
+          #    Prefer exact TypeName.cs from the old recovered project.
+          #    If filename differs, search the source declaration.
+          # ------------------------------------------------------------
+          required = [
+              "CutsceneEvent",
+              "BlockEntry",
+              "JoyStickDirection",
+          ]
+
+          copied = []
+          missing = []
+
+          def beta_declares(type_name: str) -> bool:
+              pat = re.compile(
+                  rf'\b(?:class|struct|enum|interface|delegate)\s+{re.escape(type_name)}\b'
+              )
+              for p in beta.rglob("*.cs"):
+                  try:
+                      if pat.search(p.read_text(encoding="utf-8", errors="ignore")):
+                          return True
+                  except Exception:
+                      pass
+              return False
+
+          def find_old_source(type_name: str):
+              # Fast path: AssetRipper commonly emits TypeName.cs.
+              exact = list(old.rglob(type_name + ".cs"))
+              if len(exact) == 1:
+                  return exact[0]
+
+              # Fallback: declaration search.
+              pat = re.compile(
+                  rf'\b(?:class|struct|enum|interface|delegate)\s+{re.escape(type_name)}\b'
+              )
+
+              hits = []
+              for p in old.rglob("*.cs"):
+                  try:
+                      s = p.read_text(encoding="utf-8", errors="ignore")
+                  except Exception:
+                      continue
+
+                  if pat.search(s):
+                      hits.append(p)
+
+              if len(hits) == 1:
+                  return hits[0]
+
+              # If multiple files match, prefer Assembly-CSharp runtime source.
+              runtime = [
+                  p for p in hits
+                  if "/assembly-csharp/" in p.as_posix().lower()
+                  and "/editor/" not in p.as_posix().lower()
+              ]
+              if len(runtime) == 1:
+                  return runtime[0]
+
+              return None
+
+          for type_name in required:
+              if beta_declares(type_name):
+                  report.append(f"ALREADY_PRESENT {type_name}")
+                  continue
+
+              src = find_old_source(type_name)
+
+              if src is None:
+                  missing.append(type_name)
+                  report.append(f"NOT_FOUND_IN_OLD {type_name}")
+                  continue
+
+              # Copy the entire recovered old source file. This preserves the
+              # exact enum values/serialized fields rather than inventing stubs.
+              dst = compat / src.name
+
+              # If two requested helper types live in the same source file,
+              # don't copy it twice.
+              if not dst.exists():
+                  shutil.copy2(src, dst)
+
+                  src_meta = Path(str(src) + ".meta")
+                  if src_meta.exists():
+                      shutil.copy2(src_meta, Path(str(dst) + ".meta"))
+
+              copied.append((type_name, src, dst))
+              report.append(f"COPIED {type_name}: {src} -> {dst}")
+
+          # Verify after copy.
+          still_missing = [
+              t for t in required
+              if not beta_declares(t)
+          ]
+
+          Path("output/v7-compatibility-report.txt").write_text(
+              "\n".join(report) + "\n",
+              encoding="utf-8"
+          )
+
+          Path("output/v7-compatibility-summary.txt").write_text(
+              f"physics_files_changed={physics_changed}\n"
+              f"helper_types_copied={len(copied)}\n"
+              f"helper_types_not_found={','.join(missing)}\n"
+              f"still_missing={','.join(still_missing)}\n",
+              encoding="utf-8"
+          )
+
+          print(Path("output/v7-compatibility-summary.txt").read_text())
+
+          for line in report:
+              print(line)
+
+          if still_missing:
+              raise SystemExit(
+                  "v7 could not restore helper type(s): "
+                  + ", ".join(still_missing)
+              )
+          PY
+
+          echo "===== VERIFY CURRENT ERROR NAMES ====="
+
+          grep -RIn --include='*.cs' \
+            -E '\bPhysicMaterial\b' \
+            "$BETA/Assets/Scripts/Assembly-CSharp" \
+            "$BETA/Assets/Scripts/Assembly-CSharp-firstpass" \
+            2>/dev/null || true
+
+          grep -RIn --include='*.cs' \
+            -E '\b(CutsceneEvent|BlockEntry|JoyStickDirection)\b' \
+            "$BETA/Assets/Scripts/Compatibility/OldMonoHelpers" \
+            2>/dev/null || true
+
       - name: Prepare Haring B project for iOS
         shell: bash
         run: |
@@ -671,7 +862,7 @@ jobs:
       - name: Upload hybrid Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v6-Hybrid-Project
+          name: Postal-Memories-Haring-B-v7-Hybrid-Project
           path: hybrid-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -680,7 +871,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v6-Recovery-Diagnostics
+          name: Postal-Memories-Haring-B-v7-Recovery-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -703,7 +894,7 @@ jobs:
       - name: Download hybrid project
         uses: actions/download-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-v6-Hybrid-Project
+          name: Postal-Memories-Haring-B-v7-Hybrid-Project
           path: hybrid-download
 
       - name: Extract project
@@ -1273,17 +1464,17 @@ jobs:
           cp -R "$APP" Payload/
 
           /usr/bin/zip -qry \
-            Postal-Memories-Haring-B-iOS-v6-UNSIGNED.ipa \
+            Postal-Memories-Haring-B-iOS-v7-UNSIGNED.ipa \
             Payload
 
-          ls -lh Postal-Memories-Haring-B-iOS-v6-UNSIGNED.ipa
+          ls -lh Postal-Memories-Haring-B-iOS-v7-UNSIGNED.ipa
 
       - name: Upload unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-iOS-v6-UNSIGNED
-          path: Postal-Memories-Haring-B-iOS-v6-UNSIGNED.ipa
+          name: Postal-Memories-Haring-B-iOS-v7-UNSIGNED
+          path: Postal-Memories-Haring-B-iOS-v7-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1291,7 +1482,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-Memories-Haring-B-iOS-v6-Build-Diagnostics
+          name: Postal-Memories-Haring-B-iOS-v7-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -1305,16 +1496,16 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "HARING B v1: hybrid scripts did not compile yet."
+            echo "HARING B v7: hybrid scripts did not compile yet."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "HARING B v1: Unity export succeeded but Xcode build failed."
+            echo "HARING B v7: Unity export succeeded but Xcode build failed."
             exit 1
           fi
 
-          echo "HARING B v1: FIRST UNSIGNED IPA CREATED."
+          echo "HARING B v7: FIRST UNSIGNED IPA CREATED."
 
       - name: Return Unity license
         if: always()
